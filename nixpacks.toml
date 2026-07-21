@@ -1,0 +1,16 @@
+[providers]
+providers = ["node"]
+
+[phases.setup]
+nixPkgs = [
+  "nodejs-20_x",
+  "chromium",
+  "nss",
+  "freetype",
+  "harfbuzz-icu",
+  "ttf-freefont"
+]
+
+[env]
+PUPPETEER_SKIP_CHROMIUM_DOWNLOAD = "true"
+PUPPETEER_EXECUTABLE_PATH = "/usr/bin/chromium"

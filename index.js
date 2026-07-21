@@ -1,10 +1,11 @@
 const express = require('express');
 const axios = require('axios');
+const http = require('http');
+const https = require('https');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Radio Station ID Mapping (instant.audio IDs)
 const STATIONS = {
   hiru: { id: 26516, slug: 'abc-hiru-fm' },
   shaa: { id: 26517, slug: 'abc-shaa-fm' },
@@ -15,9 +16,8 @@ const STATIONS = {
   sirasa: { id: 26521, slug: 'sirasa-fm' }
 };
 
-// Emergency Direct Fallbacks
 const FALLBACKS = {
-  hiru: 'https://radio.lotustechnologieslk.net:2020/stream/hirufmgarden/stream/1/',
+  hiru: 'http://209.133.216.3:7018/stream',
   shaa: 'http://209.133.216.3:7048/stream',
   derana: 'http://209.133.216.3:7008/stream',
   yfm: 'http://209.133.216.3:7038/stream',
@@ -26,77 +26,95 @@ const FALLBACKS = {
   sirasa: 'http://192.99.8.192:3032/stream'
 };
 
-const cache = {};
-
-// Helper: Instant Audio API එකෙන් Direct MP3 Stream URL එක අරගැනීම
-async function fetchDirectAudioStream(stationKey) {
+async function getDirectAudioUrl(stationKey) {
   const station = STATIONS[stationKey];
-  if (!station) return null;
-
-  const apiUrl = `https://api.instant.audio/data/streams/${station.id}/${station.slug}`;
+  if (!station) return FALLBACKS[stationKey];
 
   try {
-    const response = await axios.get(apiUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Referer': 'https://radio.com.lk/'
-      },
-      timeout: 5000
+    const response = await axios.get(`https://api.instant.audio/data/streams/${station.id}/${station.slug}`, {
+      headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://radio.com.lk/' },
+      timeout: 4000
     });
 
-    if (response.data && response.data.result && Array.isArray(response.data.result.streams)) {
-      const streams = response.data.result.streams;
-
-      // 1. First priority: Direct audio/mpeg MP3 URL
-      const mp3Stream = streams.find(s => s.mime === 'audio/mpeg' && s.url && s.url.startsWith('http'));
-      if (mp3Stream) return mp3Stream.url;
-
-      // 2. Second priority: Any stream URL with /stream/ or .mp3
-      const fallbackStream = streams.find(s => s.url && (s.url.includes('/stream/') || s.url.includes('.mp3')));
-      if (fallbackStream) return fallbackStream.url;
+    if (response.data?.result?.streams) {
+      const mp3 = response.data.result.streams.find(s => (s.mime === 'audio/mpeg' || s.mime === 'audio/aac') && s.url?.startsWith('http'));
+      if (mp3) return mp3.url;
     }
-  } catch (err) {
-    console.error(`API Fetch Error for ${stationKey}:`, err.message);
-  }
+  } catch (e) {}
 
-  return null;
+  return FALLBACKS[stationKey];
 }
 
 app.get('/radio/:station', async (req, res) => {
   const stationKey = req.params.station.toLowerCase();
+  const targetUrl = await getDirectAudioUrl(stationKey);
 
-  if (!STATIONS[stationKey] && !FALLBACKS[stationKey]) {
-    return res.status(404).send('Radio station not found');
+  if (!targetUrl) {
+    return res.status(502).send('Stream Unavailable');
   }
 
-  // 1. Check Cache (1 Hour cache for super fast response)
-  if (cache[stationKey]) {
-    return res.redirect(302, cache[stationKey]);
-  }
+  console.log(`[ETS2 Stream Request] ${stationKey} -> ${targetUrl}`);
 
-  // 2. Fetch Direct Stream URL from API
-  let directAudioUrl = await fetchDirectAudioStream(stationKey);
+  const isHttps = targetUrl.startsWith('https');
+  const client = isHttps ? https : http;
 
-  // 3. Fallback if API fails
-  if (!directAudioUrl) {
-    directAudioUrl = FALLBACKS[stationKey];
-  }
+  // FMOD sound engine එකට අවශ්‍ය ICY headers සෙට් කිරීම
+  const options = {
+    rejectUnauthorized: false,
+    headers: {
+      'User-Agent': 'Winamp/5.66',
+      'Accept': '*/*',
+      'Icy-MetaData': '1',
+      'Connection': 'keep-alive'
+    }
+  };
 
-  if (directAudioUrl) {
-    cache[stationKey] = directAudioUrl;
-    setTimeout(() => delete cache[stationKey], 60 * 60 * 1000); // Clear cache in 1 hour
+  const streamReq = client.get(targetUrl, options, (streamRes) => {
+    // Handling 301/302 Redirects at source level
+    if (streamRes.statusCode >= 300 && streamRes.statusCode < 400 && streamRes.headers.location) {
+      const redirectUrl = streamRes.headers.location;
+      const redirectClient = redirectUrl.startsWith('https') ? https : http;
+      return redirectClient.get(redirectUrl, options, (redRes) => {
+        res.writeHead(200, {
+          'Content-Type': 'audio/mpeg',
+          'Connection': 'keep-alive',
+          'Cache-Control': 'no-cache, no-store'
+        });
+        redRes.pipe(res);
+      });
+    }
 
-    console.log(`[SUCCESS] Redirecting ${stationKey} -> ${directAudioUrl}`);
-    return res.redirect(302, directAudioUrl);
-  }
+    if (streamRes.statusCode !== 200 && streamRes.statusCode !== 206) {
+      console.error(`Source Stream Failed with status ${streamRes.statusCode}`);
+      return res.status(502).send('Radio Stream Unavailable');
+    }
 
-  return res.status(502).send('Audio Stream Unavailable');
+    // Direct HTTP Stream headers required for ETS2 FMOD Engine
+    res.writeHead(200, {
+      'Content-Type': 'audio/mpeg',
+      'Connection': 'keep-alive',
+      'Cache-Control': 'no-cache, no-store'
+    });
+
+    streamRes.pipe(res);
+
+    req.on('close', () => {
+      streamRes.destroy();
+    });
+  });
+
+  streamReq.on('error', (err) => {
+    console.error(`Stream Connection Error: ${err.message}`);
+    if (!res.headersSent) {
+      res.status(500).send('Stream Error');
+    }
+  });
 });
 
 app.get('/', (req, res) => {
-  res.send('ETS2 Radio Scraper - High Speed Proxy Active!');
+  res.send('ETS2 Dedicated Radio Stream Proxy Active');
 });
 
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`ETS2 Radio Proxy Server active on port ${PORT}`);
 });

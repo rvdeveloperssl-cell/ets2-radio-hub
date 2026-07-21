@@ -4,11 +4,12 @@ const app = express();
 
 const PORT = process.env.PORT || 3000;
 
-// Direct Audio Stream Endpoints (Primary & Backup Nodes)
+// radio.com.lk and Direct Live Audio Endpoints Map
 const STATIONS = {
   hiru: [
     'http://stream.hirufm.lk:8000/hirufm',
-    'http://209.133.216.3:7018/stream'
+    'http://209.133.216.3:7018/stream',
+    'https://hirufm.lk/live/'
   ],
   shaa: [
     'http://stream.shaafm.lk:8000/shaafm',
@@ -36,26 +37,20 @@ const STATIONS = {
   ]
 };
 
-// Available stream එකක් සොයාගන්නා Helper Function එක
+// Function to find an active audio stream
 async function getWorkingStream(urls) {
   for (const url of urls) {
     try {
-      const response = await axios({
-        method: 'get',
-        url: url,
+      const res = await axios.get(url, {
         responseType: 'stream',
-        timeout: 5000,
-        headers: {
-          'User-Agent': 'VLC/3.0.18 LibVLC/3.0.18',
-          'Icy-MetaData': '1'
-        }
+        timeout: 4000,
+        headers: { 'User-Agent': 'VLC/3.0.18 LibVLC/3.0.18' }
       });
-
-      if (response.status === 200) {
-        return { streamUrl: url, response };
+      if (res.status === 200) {
+        return { streamUrl: url, response: res };
       }
     } catch (err) {
-      // Primary link එක වැඩ නැත්නම් ඊළඟ Backup Link එක බලයි
+      // Try next stream URL
       continue;
     }
   }
@@ -64,44 +59,40 @@ async function getWorkingStream(urls) {
 
 app.get('/radio/:station', async (req, res) => {
   const station = req.params.station.toLowerCase();
-  const stationUrls = STATIONS[station];
+  const streamUrls = STATIONS[station];
 
-  if (!stationUrls) {
-    return res.status(404).send('Station not mapped');
+  if (!streamUrls) {
+    return res.status(404).send('Station not found');
   }
 
-  const activeStream = await getWorkingStream(stationUrls);
+  const activeStream = await getWorkingStream(streamUrls);
 
   if (!activeStream) {
-    console.error(`[Error] All stream nodes down for: ${station}`);
+    console.error(`No working stream for ${station}`);
     return res.status(502).send('Radio Stream Unavailable');
   }
 
   try {
-    // ETS2 Audio Engine (FMOD) එකට අවශ්‍ය Headers
+    // ETS 2 Audio Engine Compatible Headers
     res.setHeader('Content-Type', 'audio/mpeg');
     res.setHeader('Connection', 'keep-alive');
-    res.setHeader('Cache-Control', 'no-cache, no-store');
+    res.setHeader('Accept-Ranges', 'none');
 
-    // Audio stream එක Client / Game එකට Pipe කිරීම
     activeStream.response.data.pipe(res);
 
-    // Game එකෙන් වෙනත් station එකකට මාරු වුණොත් Stream Connection එක ක්ලෝස් කිරීම
     req.on('close', () => {
       if (activeStream.response.data) {
         activeStream.response.data.destroy();
       }
     });
-  } catch (err) {
-    console.error(`Streaming Pipe Error [${station}]:`, err.message);
-    if (!res.headersSent) {
-      res.status(500).send('Streaming Error');
-    }
+  } catch (error) {
+    console.error(`Streaming error on ${station}:`, error.message);
+    res.status(500).send('Streaming Error');
   }
 });
 
 app.get('/', (req, res) => {
-  res.send('ETS2 Radio Proxy Server Active!');
+  res.send('ETS2 Radio Proxy Active!');
 });
 
 app.listen(PORT, () => {

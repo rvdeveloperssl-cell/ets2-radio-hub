@@ -1,11 +1,11 @@
 const express = require('express');
-const axios = require('axios');
+const http = require('http');
+const https = require('https');
 const puppeteer = require('puppeteer');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// radio.com.lk Target Page Slugs
 const PAGES = {
   hiru: 'https://radio.com.lk/abc-hiru-fm/',
   shaa: 'https://radio.com.lk/abc-shaa-fm/',
@@ -16,21 +16,21 @@ const PAGES = {
   sirasa: 'https://radio.com.lk/sirasa-fm/'
 };
 
-// Stream Cache (සෑම පාරම Browser එක ඕපන් නොකර වේගවත් කිරීමට)
 const streamCache = {};
 
 async function extractAudioUrlFromPage(pageUrl) {
   let browser = null;
   try {
-    // ✅ Coolify Container එකේ Chromium path එක detect කරගන්නා launch එක:
     browser = await puppeteer.launch({
       headless: 'new',
-      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium-browser' || '/usr/bin/chromium',
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium-browser',
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
         '--disable-gpu',
+        '--single-process',
+        '--no-zygote',
         '--autoplay-policy=no-user-gesture-required'
       ]
     });
@@ -38,9 +38,11 @@ async function extractAudioUrlFromPage(pageUrl) {
     const page = await browser.newPage();
     let detectedAudioUrl = null;
 
-    // Network Request මගින් Audio Stream එක අල්ලා ගැනීම
-    page.on('request', (request) => {
-      const url = request.url();
+    await page.setRequestInterception(true);
+    page.on('request', (req) => {
+      const url = req.url();
+      const resourceType = req.resourceType();
+
       if (
         (url.includes('.mp3') || url.includes('.aac') || url.includes('/stream') || url.includes(':8000') || url.includes(':70')) &&
         !url.includes('google') && !url.includes('analytics')
@@ -49,25 +51,27 @@ async function extractAudioUrlFromPage(pageUrl) {
           detectedAudioUrl = url;
         }
       }
+
+      if (['image', 'stylesheet', 'font', 'other'].includes(resourceType) && !url.includes('stream')) {
+        req.abort();
+      } else {
+        req.continue();
+      }
     });
 
-    await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+    await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
 
-    // Web site එකේ Play button එක click කිරීම
     try {
       await page.waitForSelector('button, .play, #play, .fa-play', { timeout: 3000 });
       await page.click('button, .play, #play, .fa-play');
-    } catch (e) {
-      // Play button නොතිබුණත් ස්වයංක්‍රීයව play වේ නම් දිගටම යයි
-    }
+    } catch (e) {}
 
-    // Audio Request එක හසුවන තෙක් තත්පර 4ක් රැඳී සිටීම
     await new Promise((r) => setTimeout(r, 4000));
 
     await browser.close();
     return detectedAudioUrl;
   } catch (err) {
-    console.error(`Puppeteer Error [${pageUrl}]:`, err.message);
+    console.error(`Puppeteer Scrape Error [${pageUrl}]:`, err.message);
     if (browser) await browser.close();
     return null;
   }
@@ -83,18 +87,16 @@ app.get('/radio/:station', async (req, res) => {
 
   let liveStreamUrl = streamCache[station];
 
-  // Cache එකේ නොමැති නම් Scraping සිදු කිරීම
   if (!liveStreamUrl) {
     console.log(`Scraping stream URL for ${station}...`);
     liveStreamUrl = await extractAudioUrlFromPage(targetPage);
     if (liveStreamUrl) {
+      console.log(`Found live stream for ${station}:`, liveStreamUrl);
       streamCache[station] = liveStreamUrl;
-      // විනාඩි 30කට පසු Cache එක clear කිරීම
       setTimeout(() => delete streamCache[station], 30 * 60 * 1000);
     }
   }
 
-  // Backup Manual Fallback URLs (Scraper එක අසාර්ථක වුවහොත්)
   const FALLBACKS = {
     hiru: 'http://209.133.216.3:7018/stream',
     shaa: 'http://209.133.216.3:7048/stream',
@@ -111,32 +113,47 @@ app.get('/radio/:station', async (req, res) => {
     return res.status(502).send('Radio Stream Unavailable');
   }
 
-  try {
-    const audioResponse = await axios({
-      method: 'get',
-      url: finalUrl,
-      responseType: 'stream',
-      headers: {
-        'User-Agent': 'VLC/3.0.18 LibVLC/3.0.18'
-      },
-      timeout: 10000
-    });
+  // Native HTTP Stream Proxy (Bypasses 403 blocks)
+  const client = finalUrl.startsWith('https') ? https : http;
 
-    res.setHeader('Content-Type', 'audio/mpeg');
+  const options = {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Icy-MetaData': '1'
+    }
+  };
+
+  const streamReq = client.get(finalUrl, options, (streamRes) => {
+    // Follow Redirects
+    if (streamRes.statusCode >= 300 && streamRes.statusCode < 400 && streamRes.headers.location) {
+      console.log(`Redirecting to: ${streamRes.headers.location}`);
+      return res.redirect(streamRes.headers.location);
+    }
+
+    if (streamRes.statusCode !== 200) {
+      console.error(`Stream Status Code Error [${station}]: ${streamRes.statusCode}`);
+      delete streamCache[station];
+      return res.status(500).send(`Stream Failed with Status: ${streamRes.statusCode}`);
+    }
+
+    res.setHeader('Content-Type', streamRes.headers['content-type'] || 'audio/mpeg');
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('Cache-Control', 'no-cache');
 
-    audioResponse.data.pipe(res);
+    streamRes.pipe(res);
 
     req.on('close', () => {
-      if (audioResponse.data) audioResponse.data.destroy();
+      streamRes.destroy();
     });
-  } catch (err) {
-    console.error(`Stream Connection Error:`, err.message);
-    // Link එක expire වී ඇත්නම් Cache එක Clear කිරීම
+  });
+
+  streamReq.on('error', (err) => {
+    console.error(`Stream Request Error [${station}]:`, err.message);
     delete streamCache[station];
-    res.status(500).send('Stream Proxy Connection Failed');
-  }
+    if (!res.headersSent) {
+      res.status(500).send('Stream Proxy Connection Failed');
+    }
+  });
 });
 
 app.get('/', (req, res) => {

@@ -18,6 +18,31 @@ const PAGES = {
 
 const streamCache = {};
 
+// Helper: Instant Audio JSON එකක් ආවොත් Direct Stream URL එක Extract කිරීමට
+async function getStreamFromJsonApi(apiUrl) {
+  return new Promise((resolve) => {
+    https.get(apiUrl, (res) => {
+      let data = '';
+      res.on('data', (chunk) => (data += chunk));
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(data);
+          if (json && json.result && json.result.streams) {
+            // mime: "audio/mpeg" තියෙන direct audio stream එක සෙවීම
+            const audioObj = json.result.streams.find(
+              (s) => s.mime === 'audio/mpeg' || (s.url && s.url.includes('/stream/'))
+            );
+            if (audioObj && audioObj.url) {
+              return resolve(audioObj.url);
+            }
+          }
+        } catch (e) {}
+        resolve(null);
+      });
+    }).on('error', () => resolve(null));
+  });
+}
+
 async function extractAudioUrlFromPage(pageUrl) {
   let browser = null;
   try {
@@ -38,34 +63,15 @@ async function extractAudioUrlFromPage(pageUrl) {
     const page = await browser.newPage();
     let detectedAudioUrl = null;
 
-    // Fetch instant.audio JSON API directly if trapped
-    page.on('response', async (response) => {
-      const url = response.url();
-      if (url.includes('api.instant.audio/data/streams/')) {
-        try {
-          const json = await response.json();
-          if (json && json.result && json.result.streams) {
-            // Find valid audio stream URL inside JSON
-            const audioStream = json.result.streams.find(
-              (s) => s.mime === 'audio/mpeg' || s.url.includes('/stream/') || s.url.includes('.mp3')
-            );
-            if (audioStream && audioStream.url) {
-              detectedAudioUrl = audioStream.url;
-            }
-          }
-        } catch (e) {}
-      }
-    });
-
     await page.setRequestInterception(true);
     page.on('request', (req) => {
       const url = req.url();
       const resourceType = req.resourceType();
 
-      // Direct MP3/AAC or Stream URL Detection
+      // Direct Stream හෝ Instant Audio API URL එක Catch කරගැනීම
       if (
-        (url.includes('.mp3') || url.includes('.aac') || url.includes('/stream/') || url.includes(':8000') || url.includes(':70')) &&
-        !url.includes('google') && !url.includes('analytics') && !url.includes('api.instant.audio')
+        (url.includes('.mp3') || url.includes('.aac') || url.includes('/stream/') || url.includes('api.instant.audio') || url.includes(':8000') || url.includes(':70')) &&
+        !url.includes('google') && !url.includes('analytics')
       ) {
         if (!detectedAudioUrl) {
           detectedAudioUrl = url;
@@ -109,9 +115,20 @@ app.get('/radio/:station', async (req, res) => {
 
   if (!liveStreamUrl) {
     console.log(`Scraping stream URL for ${station}...`);
-    liveStreamUrl = await extractAudioUrlFromPage(targetPage);
-    if (liveStreamUrl) {
-      console.log(`Found live stream for ${station}:`, liveStreamUrl);
+    let detectedUrl = await extractAudioUrlFromPage(targetPage);
+
+    // 🎯 FIX: Detected URL එක instant.audio API එකක් නම්, ඒකෙන් Direct Audio URL එක Extract කිරීම
+    if (detectedUrl && detectedUrl.includes('api.instant.audio')) {
+      console.log(`Instant Audio API detected: ${detectedUrl}. Extracting direct stream...`);
+      const directAudioUrl = await getStreamFromJsonApi(detectedUrl);
+      if (directAudioUrl) {
+        detectedUrl = directAudioUrl;
+      }
+    }
+
+    if (detectedUrl) {
+      liveStreamUrl = detectedUrl;
+      console.log(`Final live stream for ${station}:`, liveStreamUrl);
       streamCache[station] = liveStreamUrl;
       setTimeout(() => delete streamCache[station], 30 * 60 * 1000);
     }

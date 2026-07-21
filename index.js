@@ -44,7 +44,7 @@ async function extractAudioUrlFromPage(pageUrl) {
       const resourceType = req.resourceType();
 
       if (
-        (url.includes('.mp3') || url.includes('.aac') || url.includes('/stream') || url.includes(':8000') || url.includes(':70')) &&
+        (url.includes('.mp3') || url.includes('.aac') || url.includes('/stream') || url.includes('/streams/') || url.includes(':8000') || url.includes(':70')) &&
         !url.includes('google') && !url.includes('analytics')
       ) {
         if (!detectedAudioUrl) {
@@ -113,21 +113,34 @@ app.get('/radio/:station', async (req, res) => {
     return res.status(502).send('Radio Stream Unavailable');
   }
 
-  // Native HTTP Stream Proxy (Bypasses 403 blocks)
   const client = finalUrl.startsWith('https') ? https : http;
 
+  // 🛠️ FIX: Full Headers bypass 403 on instant.audio API
   const options = {
     headers: {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Referer': targetPage,
+      'Origin': 'https://radio.com.lk',
+      'Accept': '*/*',
+      'Accept-Language': 'en-US,en;q=0.9',
       'Icy-MetaData': '1'
     }
   };
 
   const streamReq = client.get(finalUrl, options, (streamRes) => {
-    // Follow Redirects
+    // Handle Redirects (301/302)
     if (streamRes.statusCode >= 300 && streamRes.statusCode < 400 && streamRes.headers.location) {
-      console.log(`Redirecting to: ${streamRes.headers.location}`);
-      return res.redirect(streamRes.headers.location);
+      console.log(`Redirecting stream to: ${streamRes.headers.location}`);
+      
+      const redirectUrl = streamRes.headers.location;
+      const redirectClient = redirectUrl.startsWith('https') ? https : http;
+      
+      return redirectClient.get(redirectUrl, options, (redRes) => {
+        res.setHeader('Content-Type', redRes.headers['content-type'] || 'audio/mpeg');
+        res.setHeader('Connection', 'keep-alive');
+        res.setHeader('Cache-Control', 'no-cache');
+        redRes.pipe(res);
+      });
     }
 
     if (streamRes.statusCode !== 200) {

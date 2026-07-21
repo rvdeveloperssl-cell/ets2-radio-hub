@@ -38,14 +38,34 @@ async function extractAudioUrlFromPage(pageUrl) {
     const page = await browser.newPage();
     let detectedAudioUrl = null;
 
+    // Fetch instant.audio JSON API directly if trapped
+    page.on('response', async (response) => {
+      const url = response.url();
+      if (url.includes('api.instant.audio/data/streams/')) {
+        try {
+          const json = await response.json();
+          if (json && json.result && json.result.streams) {
+            // Find valid audio stream URL inside JSON
+            const audioStream = json.result.streams.find(
+              (s) => s.mime === 'audio/mpeg' || s.url.includes('/stream/') || s.url.includes('.mp3')
+            );
+            if (audioStream && audioStream.url) {
+              detectedAudioUrl = audioStream.url;
+            }
+          }
+        } catch (e) {}
+      }
+    });
+
     await page.setRequestInterception(true);
     page.on('request', (req) => {
       const url = req.url();
       const resourceType = req.resourceType();
 
+      // Direct MP3/AAC or Stream URL Detection
       if (
-        (url.includes('.mp3') || url.includes('.aac') || url.includes('/stream') || url.includes('/streams/') || url.includes(':8000') || url.includes(':70')) &&
-        !url.includes('google') && !url.includes('analytics')
+        (url.includes('.mp3') || url.includes('.aac') || url.includes('/stream/') || url.includes(':8000') || url.includes(':70')) &&
+        !url.includes('google') && !url.includes('analytics') && !url.includes('api.instant.audio')
       ) {
         if (!detectedAudioUrl) {
           detectedAudioUrl = url;
@@ -115,23 +135,17 @@ app.get('/radio/:station', async (req, res) => {
 
   const client = finalUrl.startsWith('https') ? https : http;
 
-  // 🛠️ FIX: Full Headers bypass 403 on instant.audio API
   const options = {
     headers: {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      'Referer': targetPage,
-      'Origin': 'https://radio.com.lk',
-      'Accept': '*/*',
-      'Accept-Language': 'en-US,en;q=0.9',
+      'Referer': 'https://radio.com.lk/',
       'Icy-MetaData': '1'
     }
   };
 
   const streamReq = client.get(finalUrl, options, (streamRes) => {
-    // Handle Redirects (301/302)
+    // Handle Redirects
     if (streamRes.statusCode >= 300 && streamRes.statusCode < 400 && streamRes.headers.location) {
-      console.log(`Redirecting stream to: ${streamRes.headers.location}`);
-      
       const redirectUrl = streamRes.headers.location;
       const redirectClient = redirectUrl.startsWith('https') ? https : http;
       

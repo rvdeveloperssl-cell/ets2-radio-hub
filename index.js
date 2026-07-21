@@ -22,12 +22,15 @@ const streamCache = {};
 async function extractAudioUrlFromPage(pageUrl) {
   let browser = null;
   try {
+    // ✅ Coolify Container එකේ Chromium path එක detect කරගන්නා launch එක:
     browser = await puppeteer.launch({
       headless: 'new',
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium-browser' || '/usr/bin/chromium',
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
+        '--disable-gpu',
         '--autoplay-policy=no-user-gesture-required'
       ]
     });

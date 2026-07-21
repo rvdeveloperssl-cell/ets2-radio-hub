@@ -1,5 +1,6 @@
 const express = require('express');
 const https = require('https');
+const http = require('http');
 const puppeteer = require('puppeteer');
 
 const app = express();
@@ -27,35 +28,17 @@ const FALLBACKS = {
 
 const streamCache = {};
 
-// Helper: API එකෙන් Direct Audio Stream URL එක සෙවීම
-async function getStreamFromJsonApi(apiUrl) {
-  return new Promise((resolve) => {
-    const options = {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Referer': 'https://radio.com.lk/'
-      }
-    };
-
-    https.get(apiUrl, options, (res) => {
-      let data = '';
-      res.on('data', (chunk) => (data += chunk));
-      res.on('end', () => {
-        try {
-          const json = JSON.parse(data);
-          if (json && json.result && json.result.streams) {
-            const audioObj = json.result.streams.find(
-              (s) => s.mime === 'audio/mpeg' || (s.url && s.url.includes('/stream/'))
-            );
-            if (audioObj && audioObj.url) {
-              return resolve(audioObj.url);
-            }
-          }
-        } catch (e) {}
-        resolve(null);
-      });
-    }).on('error', () => resolve(null));
-  });
+// Helper: JSON response එකක් ආවොත් ඒකෙන් audio stream URL එක අරගැනීම
+function extractFromAudioJson(jsonObj) {
+  if (jsonObj && jsonObj.result && Array.isArray(jsonObj.result.streams)) {
+    const audioObj = jsonObj.result.streams.find(
+      (s) => s.mime === 'audio/mpeg' || s.mime === 'audio/aac' || (s.url && s.url.includes('/stream/'))
+    );
+    if (audioObj && audioObj.url) {
+      return audioObj.url;
+    }
+  }
+  return null;
 }
 
 async function extractAudioUrlFromPage(pageUrl) {
@@ -69,8 +52,7 @@ async function extractAudioUrlFromPage(pageUrl) {
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
         '--disable-gpu',
-        '--single-process',
-        '--no-zygote'
+        '--single-process'
       ]
     });
 
@@ -98,14 +80,29 @@ async function extractAudioUrlFromPage(pageUrl) {
       }
     });
 
-    await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: 12000 }).catch(() => {});
+    const response = await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: 12000 }).catch(() => null);
+
+    // Page එකෙන් direct JSON response එකක් ආවොත් ඒක parse කරලා ගන්නවා
+    if (response) {
+      try {
+        const textContent = await response.text();
+        const parsedJson = JSON.parse(textContent);
+        const streamFromJson = extractFromAudioJson(parsedJson);
+        if (streamFromJson) {
+          await browser.close();
+          return streamFromJson;
+        }
+      } catch (e) {
+        // Direct JSON එකක් නෙමෙයි නම් normal page handling එකට යනවා
+      }
+    }
 
     try {
       await page.waitForSelector('button, .play, #play, .fa-play', { timeout: 3000 });
       await page.click('button, .play, #play, .fa-play');
     } catch (e) {}
 
-    await new Promise((r) => setTimeout(r, 3000));
+    await new Promise((r) => setTimeout(r, 2000));
 
     await browser.close();
     return detectedAudioUrl;
@@ -128,20 +125,12 @@ app.get('/radio/:station', async (req, res) => {
     let liveStreamUrl = streamCache[station];
 
     if (!liveStreamUrl) {
-      console.log(`Scraping stream for ${station}...`);
       let detectedUrl = await extractAudioUrlFromPage(targetPage);
-
-      if (detectedUrl && detectedUrl.includes('api.instant.audio')) {
-        const directAudioUrl = await getStreamFromJsonApi(detectedUrl);
-        if (directAudioUrl) {
-          detectedUrl = directAudioUrl;
-        }
-      }
 
       if (detectedUrl) {
         liveStreamUrl = detectedUrl;
         streamCache[station] = liveStreamUrl;
-        setTimeout(() => delete streamCache[station], 30 * 60 * 1000);
+        setTimeout(() => delete streamCache[station], 30 * 60 * 1000); // 30 min cache
       }
     }
 
@@ -151,12 +140,10 @@ app.get('/radio/:station', async (req, res) => {
       return res.status(502).send('Radio Stream Unavailable');
     }
 
-    console.log(`Redirecting client to: ${finalUrl}`);
-    // Direct Redirect (302) to audio stream - Prevents 500 Proxy/SSL crashes completely
+    // Direct redirecting to the live audio stream
     return res.redirect(302, finalUrl);
 
   } catch (globalErr) {
-    console.error('Unhandled Route Error:', globalErr.message);
     const station = req.params.station ? req.params.station.toLowerCase() : null;
     if (station && FALLBACKS[station]) {
       return res.redirect(302, FALLBACKS[station]);
@@ -166,9 +153,9 @@ app.get('/radio/:station', async (req, res) => {
 });
 
 app.get('/', (req, res) => {
-  res.send('ETS2 Radio Scraper Proxy Active!');
+  res.send('Radio Scraper Proxy Active!');
 });
 
 app.listen(PORT, () => {
-  console.log(`Server active on port ${PORT}`);
+  console.log(`Server running on port ${PORT}`);
 });

@@ -1,21 +1,21 @@
 const express = require('express');
-const https = require('https');
-const http = require('http');
-const puppeteer = require('puppeteer');
+const axios = require('axios');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const PAGES = {
-  hiru: 'https://radio.com.lk/abc-hiru-fm/',
-  shaa: 'https://radio.com.lk/abc-shaa-fm/',
-  derana: 'https://radio.com.lk/fm-derana/',
-  yfm: 'https://radio.com.lk/y-fm/',
-  siyatha: 'https://radio.com.lk/siyatha-fm/',
-  neth: 'https://radio.com.lk/neth-fm/',
-  sirasa: 'https://radio.com.lk/sirasa-fm/'
+// Radio Station ID Mapping (instant.audio IDs)
+const STATIONS = {
+  hiru: { id: 26516, slug: 'abc-hiru-fm' },
+  shaa: { id: 26517, slug: 'abc-shaa-fm' },
+  derana: { id: 26515, slug: 'fm-derana' },
+  yfm: { id: 26518, slug: 'y-fm' },
+  siyatha: { id: 26519, slug: 'siyatha-fm' },
+  neth: { id: 26520, slug: 'neth-fm' },
+  sirasa: { id: 26521, slug: 'sirasa-fm' }
 };
 
+// Emergency Direct Fallbacks
 const FALLBACKS = {
   hiru: 'https://radio.lotustechnologieslk.net:2020/stream/hirufmgarden/stream/1/',
   shaa: 'http://209.133.216.3:7048/stream',
@@ -26,134 +26,75 @@ const FALLBACKS = {
   sirasa: 'http://192.99.8.192:3032/stream'
 };
 
-const streamCache = {};
+const cache = {};
 
-// Helper: JSON response එකක් ආවොත් ඒකෙන් audio stream URL එක අරගැනීම
-function extractFromAudioJson(jsonObj) {
-  if (jsonObj && jsonObj.result && Array.isArray(jsonObj.result.streams)) {
-    const audioObj = jsonObj.result.streams.find(
-      (s) => s.mime === 'audio/mpeg' || s.mime === 'audio/aac' || (s.url && s.url.includes('/stream/'))
-    );
-    if (audioObj && audioObj.url) {
-      return audioObj.url;
+// Helper: Instant Audio API එකෙන් Direct MP3 Stream URL එක අරගැනීම
+async function fetchDirectAudioStream(stationKey) {
+  const station = STATIONS[stationKey];
+  if (!station) return null;
+
+  const apiUrl = `https://api.instant.audio/data/streams/${station.id}/${station.slug}`;
+
+  try {
+    const response = await axios.get(apiUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Referer': 'https://radio.com.lk/'
+      },
+      timeout: 5000
+    });
+
+    if (response.data && response.data.result && Array.isArray(response.data.result.streams)) {
+      const streams = response.data.result.streams;
+
+      // 1. First priority: Direct audio/mpeg MP3 URL
+      const mp3Stream = streams.find(s => s.mime === 'audio/mpeg' && s.url && s.url.startsWith('http'));
+      if (mp3Stream) return mp3Stream.url;
+
+      // 2. Second priority: Any stream URL with /stream/ or .mp3
+      const fallbackStream = streams.find(s => s.url && (s.url.includes('/stream/') || s.url.includes('.mp3')));
+      if (fallbackStream) return fallbackStream.url;
     }
+  } catch (err) {
+    console.error(`API Fetch Error for ${stationKey}:`, err.message);
   }
+
   return null;
 }
 
-async function extractAudioUrlFromPage(pageUrl) {
-  let browser = null;
-  try {
-    browser = await puppeteer.launch({
-      headless: 'new',
-      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium-browser',
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--single-process'
-      ]
-    });
-
-    const page = await browser.newPage();
-    let detectedAudioUrl = null;
-
-    await page.setRequestInterception(true);
-    page.on('request', (req) => {
-      const url = req.url();
-      const resourceType = req.resourceType();
-
-      if (
-        (url.includes('.mp3') || url.includes('.aac') || url.includes('/stream/') || url.includes('api.instant.audio')) &&
-        !url.includes('google') && !url.includes('analytics')
-      ) {
-        if (!detectedAudioUrl) {
-          detectedAudioUrl = url;
-        }
-      }
-
-      if (['image', 'stylesheet', 'font', 'other'].includes(resourceType) && !url.includes('stream')) {
-        req.abort().catch(() => {});
-      } else {
-        req.continue().catch(() => {});
-      }
-    });
-
-    const response = await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: 12000 }).catch(() => null);
-
-    // Page එකෙන් direct JSON response එකක් ආවොත් ඒක parse කරලා ගන්නවා
-    if (response) {
-      try {
-        const textContent = await response.text();
-        const parsedJson = JSON.parse(textContent);
-        const streamFromJson = extractFromAudioJson(parsedJson);
-        if (streamFromJson) {
-          await browser.close();
-          return streamFromJson;
-        }
-      } catch (e) {
-        // Direct JSON එකක් නෙමෙයි නම් normal page handling එකට යනවා
-      }
-    }
-
-    try {
-      await page.waitForSelector('button, .play, #play, .fa-play', { timeout: 3000 });
-      await page.click('button, .play, #play, .fa-play');
-    } catch (e) {}
-
-    await new Promise((r) => setTimeout(r, 2000));
-
-    await browser.close();
-    return detectedAudioUrl;
-  } catch (err) {
-    console.error(`Puppeteer Error:`, err.message);
-    if (browser) await browser.close().catch(() => {});
-    return null;
-  }
-}
-
 app.get('/radio/:station', async (req, res) => {
-  try {
-    const station = req.params.station.toLowerCase();
-    const targetPage = PAGES[station];
+  const stationKey = req.params.station.toLowerCase();
 
-    if (!targetPage) {
-      return res.status(404).send('Station not mapped.');
-    }
-
-    let liveStreamUrl = streamCache[station];
-
-    if (!liveStreamUrl) {
-      let detectedUrl = await extractAudioUrlFromPage(targetPage);
-
-      if (detectedUrl) {
-        liveStreamUrl = detectedUrl;
-        streamCache[station] = liveStreamUrl;
-        setTimeout(() => delete streamCache[station], 30 * 60 * 1000); // 30 min cache
-      }
-    }
-
-    const finalUrl = liveStreamUrl || FALLBACKS[station];
-
-    if (!finalUrl) {
-      return res.status(502).send('Radio Stream Unavailable');
-    }
-
-    // Direct redirecting to the live audio stream
-    return res.redirect(302, finalUrl);
-
-  } catch (globalErr) {
-    const station = req.params.station ? req.params.station.toLowerCase() : null;
-    if (station && FALLBACKS[station]) {
-      return res.redirect(302, FALLBACKS[station]);
-    }
-    return res.status(500).send('Internal Server Error');
+  if (!STATIONS[stationKey] && !FALLBACKS[stationKey]) {
+    return res.status(404).send('Radio station not found');
   }
+
+  // 1. Check Cache (1 Hour cache for super fast response)
+  if (cache[stationKey]) {
+    return res.redirect(302, cache[stationKey]);
+  }
+
+  // 2. Fetch Direct Stream URL from API
+  let directAudioUrl = await fetchDirectAudioStream(stationKey);
+
+  // 3. Fallback if API fails
+  if (!directAudioUrl) {
+    directAudioUrl = FALLBACKS[stationKey];
+  }
+
+  if (directAudioUrl) {
+    cache[stationKey] = directAudioUrl;
+    setTimeout(() => delete cache[stationKey], 60 * 60 * 1000); // Clear cache in 1 hour
+
+    console.log(`[SUCCESS] Redirecting ${stationKey} -> ${directAudioUrl}`);
+    return res.redirect(302, directAudioUrl);
+  }
+
+  return res.status(502).send('Audio Stream Unavailable');
 });
 
 app.get('/', (req, res) => {
-  res.send('Radio Scraper Proxy Active!');
+  res.send('ETS2 Radio Scraper - High Speed Proxy Active!');
 });
 
 app.listen(PORT, () => {

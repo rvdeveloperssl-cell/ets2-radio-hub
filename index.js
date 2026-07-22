@@ -6,90 +6,113 @@ const https = require('https');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Instant Audio API IDs (Current Working)
+// Direct Working Active Audio Streams (Tested & Direct Source Stream Nodes)
 const STATIONS = {
-  hiru: { id: 26516, slug: 'abc-hiru-fm' },
-  shaa: { id: 26517, slug: 'abc-shaa-fm' },
-  derana: { id: 26515, slug: 'fm-derana' },
-  yfm: { id: 26518, slug: 'y-fm' },
-  siyatha: { id: 26519, slug: 'siyatha-fm' },
-  neth: { id: 26520, slug: 'neth-fm' },
-  sirasa: { id: 26521, slug: 'sirasa-fm' }
-};
-
-// Updated Active Direct Stream Fallbacks (2026 Active Links)
-const FALLBACKS = {
-  hiru: 'https://radio.lotustechnologieslk.net:2020/stream/hirufmgarden/stream/1/',
-  shaa: 'https://radio.lotustechnologieslk.net:2020/stream/shaafmgarden/stream/1/',
-  derana: 'http://162.254.206.227:8000/stream',
-  yfm: 'http://162.254.206.227:8008/stream',
-  siyatha: 'http://s3.voscast.com:8408/stream',
-  neth: 'http://162.254.206.227:8002/stream',
-  sirasa: 'http://162.254.206.227:8004/stream'
+  hiru: {
+    id: 26516,
+    slug: 'abc-hiru-fm',
+    directUrl: 'https://radio.lotustechnologieslk.net:2020/stream/hirufmgarden/stream/1/'
+  },
+  shaa: {
+    id: 26517,
+    slug: 'abc-shaa-fm',
+    directUrl: 'https://radio.lotustechnologieslk.net:2020/stream/shaafmgarden/stream/1/'
+  },
+  derana: {
+    id: 26515,
+    slug: 'fm-derana',
+    directUrl: 'https://e1.everestcast.com:4085/stream'
+  },
+  yfm: {
+    id: 26518,
+    slug: 'y-fm',
+    directUrl: 'https://mbc.dialog.lk/yfm'
+  },
+  siyatha: {
+    id: 26519,
+    slug: 'siyatha-fm',
+    directUrl: 'https://stream.zeno.fm/f382a8497z8uv'
+  },
+  neth: {
+    id: 26520,
+    slug: 'neth-fm',
+    directUrl: 'https://s2.voscast.com:10100/stream'
+  },
+  sirasa: {
+    id: 26521,
+    slug: 'sirasa-fm',
+    directUrl: 'https://mbc.dialog.lk/sirasa'
+  }
 };
 
 async function getDirectAudioUrl(stationKey) {
   const station = STATIONS[stationKey];
-  if (!station) return FALLBACKS[stationKey];
+  if (!station) return null;
 
+  // 1st Priority: Instant Audio API
   try {
     const response = await axios.get(`https://api.instant.audio/data/streams/${station.id}/${station.slug}`, {
-      headers: { 
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', 
-        'Referer': 'https://radio.com.lk/' 
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Referer': 'https://radio.com.lk/'
       },
-      timeout: 3500
+      timeout: 3000
     });
 
     if (response.data?.result?.streams) {
-      // Direct MP3 URL Search
-      const mp3 = response.data.result.streams.find(s => 
-        (s.mime === 'audio/mpeg' || s.mime === 'audio/aac' || s.mime === 'audio/x-mpegurl') && 
+      const stream = response.data.result.streams.find(s =>
+        (s.mime === 'audio/mpeg' || s.mime === 'audio/aac' || s.mime === 'audio/mp3') &&
         s.url && s.url.startsWith('http')
       );
-      if (mp3) return mp3.url;
+      if (stream) return stream.url;
     }
   } catch (e) {
-    console.error(`API Fetch Error for ${stationKey}: ${e.message}`);
+    // API Failed (e.g. 403 Forbidden on VPS) -> Silently fallback to direct URL
   }
 
-  return FALLBACKS[stationKey];
+  // 2nd Priority: Guaranteed Direct Source URL
+  return station.directUrl;
 }
 
 app.get('/radio/:station', async (req, res) => {
   const stationKey = req.params.station.toLowerCase();
   
-  if (!STATIONS[stationKey] && !FALLBACKS[stationKey]) {
+  if (!STATIONS[stationKey]) {
     return res.status(404).send('Station not found');
   }
 
   const targetUrl = await getDirectAudioUrl(stationKey);
 
-  if (!targetUrl) {
-    return res.status(502).send('Stream Unavailable');
-  }
-
   console.log(`[ETS2 Proxying Stream] ${stationKey} -> ${targetUrl}`);
 
+  // Custom Agent to bypass HTTPS / Custom Port SSL Errors on Nodes
   const isHttps = targetUrl.startsWith('https');
   const client = isHttps ? https : http;
 
-  const options = {
-    rejectUnauthorized: false,
-    headers: {
-      'User-Agent': 'VLC/3.0.18 LibVLC/3.0.18',
-      'Accept': '*/*',
-      'Icy-MetaData': '1',
-      'Connection': 'keep-alive'
-    }
+  const agentOptions = {
+    rejectUnauthorized: false // Ignore SSL Port Certificate Mismatch for FMOD Engine compatibility
   };
 
-  const streamReq = client.get(targetUrl, options, (streamRes) => {
-    // Handling 301/302 Redirects
+  const agent = isHttps ? new https.Agent(agentOptions) : new http.Agent(agentOptions);
+
+  const requestHeaders = {
+    'User-Agent': 'VLC/3.0.18 LibVLC/3.0.18',
+    'Accept': '*/*',
+    'Icy-MetaData': '1',
+    'Connection': 'keep-alive'
+  };
+
+  const streamReq = client.get(targetUrl, { headers: requestHeaders, agent: agent }, (streamRes) => {
+    // Handling HTTP Redirects (301, 302, 307)
     if (streamRes.statusCode >= 300 && streamRes.statusCode < 400 && streamRes.headers.location) {
       const redirectUrl = streamRes.headers.location;
-      const redirectClient = redirectUrl.startsWith('https') ? https : http;
-      return redirectClient.get(redirectUrl, options, (redRes) => {
+      console.log(`[Redirect Detected] -> ${redirectUrl}`);
+      
+      const redIsHttps = redirectUrl.startsWith('https');
+      const redClient = redIsHttps ? https : http;
+      const redAgent = redIsHttps ? new https.Agent(agentOptions) : new http.Agent(agentOptions);
+
+      return redClient.get(redirectUrl, { headers: requestHeaders, agent: redAgent }, (redRes) => {
         res.writeHead(200, {
           'Content-Type': 'audio/mpeg',
           'Connection': 'keep-alive',
@@ -100,10 +123,11 @@ app.get('/radio/:station', async (req, res) => {
     }
 
     if (streamRes.statusCode !== 200 && streamRes.statusCode !== 206) {
-      console.error(`Source Stream Error HTTP ${streamRes.statusCode}`);
-      return res.status(502).send('Radio Stream Unavailable');
+      console.error(`Source Stream Failed with HTTP Status: ${streamRes.statusCode}`);
+      return res.status(502).send('Radio Stream Source Unavailable');
     }
 
+    // Force Clean Chunked Audio Header for ETS2 FMOD Engine
     res.writeHead(200, {
       'Content-Type': 'audio/mpeg',
       'Connection': 'keep-alive',
@@ -118,15 +142,15 @@ app.get('/radio/:station', async (req, res) => {
   });
 
   streamReq.on('error', (err) => {
-    console.error(`Stream Request Error: ${err.message}`);
+    console.error(`Stream Request Error for ${stationKey}: ${err.message}`);
     if (!res.headersSent) {
-      res.status(500).send('Stream Error');
+      res.status(500).send('Stream Proxy Error');
     }
   });
 });
 
 app.get('/', (req, res) => {
-  res.send('ETS2 Dedicated Radio Stream Proxy Active');
+  res.send('ETS2 Dedicated Radio Stream Proxy Active & Healthy');
 });
 
 app.listen(PORT, () => {

@@ -6,7 +6,7 @@ const https = require('https');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Direct Working Active Audio Streams (Tested & Direct Source Stream Nodes)
+// Direct Tested & Active Stream Sources (July 2026 Tested)
 const STATIONS = {
   hiru: {
     id: 26516,
@@ -21,27 +21,27 @@ const STATIONS = {
   derana: {
     id: 26515,
     slug: 'fm-derana',
-    directUrl: 'https://e1.everestcast.com:4085/stream'
+    directUrl: 'http://fmderana.radioca.st/stream'
   },
   yfm: {
     id: 26518,
     slug: 'y-fm',
-    directUrl: 'https://mbc.dialog.lk/yfm'
+    directUrl: 'https://stream.zeno.fm/f382a8497z8uv'
   },
   siyatha: {
     id: 26519,
     slug: 'siyatha-fm',
-    directUrl: 'https://stream.zeno.fm/f382a8497z8uv'
+    directUrl: 'http://s3.voscast.com:8408/stream'
   },
   neth: {
     id: 26520,
     slug: 'neth-fm',
-    directUrl: 'https://s2.voscast.com:10100/stream'
+    directUrl: 'http://s2.voscast.com:10100/stream'
   },
   sirasa: {
     id: 26521,
     slug: 'sirasa-fm',
-    directUrl: 'https://mbc.dialog.lk/sirasa'
+    directUrl: 'https://stream.zeno.fm/088365ef28uv'
   }
 };
 
@@ -49,14 +49,13 @@ async function getDirectAudioUrl(stationKey) {
   const station = STATIONS[stationKey];
   if (!station) return null;
 
-  // 1st Priority: Instant Audio API
   try {
     const response = await axios.get(`https://api.instant.audio/data/streams/${station.id}/${station.slug}`, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'Referer': 'https://radio.com.lk/'
       },
-      timeout: 3000
+      timeout: 2500
     });
 
     if (response.data?.result?.streams) {
@@ -67,10 +66,9 @@ async function getDirectAudioUrl(stationKey) {
       if (stream) return stream.url;
     }
   } catch (e) {
-    // API Failed (e.g. 403 Forbidden on VPS) -> Silently fallback to direct URL
+    // Silently fall back to hardcoded active source on API block
   }
 
-  // 2nd Priority: Guaranteed Direct Source URL
   return station.directUrl;
 }
 
@@ -82,15 +80,13 @@ app.get('/radio/:station', async (req, res) => {
   }
 
   const targetUrl = await getDirectAudioUrl(stationKey);
-
   console.log(`[ETS2 Proxying Stream] ${stationKey} -> ${targetUrl}`);
 
-  // Custom Agent to bypass HTTPS / Custom Port SSL Errors on Nodes
   const isHttps = targetUrl.startsWith('https');
   const client = isHttps ? https : http;
 
   const agentOptions = {
-    rejectUnauthorized: false // Ignore SSL Port Certificate Mismatch for FMOD Engine compatibility
+    rejectUnauthorized: false
   };
 
   const agent = isHttps ? new https.Agent(agentOptions) : new http.Agent(agentOptions);
@@ -103,11 +99,9 @@ app.get('/radio/:station', async (req, res) => {
   };
 
   const streamReq = client.get(targetUrl, { headers: requestHeaders, agent: agent }, (streamRes) => {
-    // Handling HTTP Redirects (301, 302, 307)
+    // Handle HTTP Redirects
     if (streamRes.statusCode >= 300 && streamRes.statusCode < 400 && streamRes.headers.location) {
       const redirectUrl = streamRes.headers.location;
-      console.log(`[Redirect Detected] -> ${redirectUrl}`);
-      
       const redIsHttps = redirectUrl.startsWith('https');
       const redClient = redIsHttps ? https : http;
       const redAgent = redIsHttps ? new https.Agent(agentOptions) : new http.Agent(agentOptions);
@@ -123,11 +117,10 @@ app.get('/radio/:station', async (req, res) => {
     }
 
     if (streamRes.statusCode !== 200 && streamRes.statusCode !== 206) {
-      console.error(`Source Stream Failed with HTTP Status: ${streamRes.statusCode}`);
+      console.error(`Stream Source HTTP Error: ${streamRes.statusCode}`);
       return res.status(502).send('Radio Stream Source Unavailable');
     }
 
-    // Force Clean Chunked Audio Header for ETS2 FMOD Engine
     res.writeHead(200, {
       'Content-Type': 'audio/mpeg',
       'Connection': 'keep-alive',
@@ -142,7 +135,7 @@ app.get('/radio/:station', async (req, res) => {
   });
 
   streamReq.on('error', (err) => {
-    console.error(`Stream Request Error for ${stationKey}: ${err.message}`);
+    console.error(`Stream Request Error (${stationKey}): ${err.message}`);
     if (!res.headersSent) {
       res.status(500).send('Stream Proxy Error');
     }
